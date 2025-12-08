@@ -7,62 +7,81 @@ from urllib.parse import quote
 import requests
 from flask import Flask
 from xml.etree import ElementTree as ET
+import random
 
 app = Flask(__name__)
 
+# ===== SAFE HELPER =====
 def safe_str(value):
-    """Convert any value to safe string for URL encoding"""
     if value is None:
         return ""
     return str(value)
 
-def sign(params):
-    # Convert all values to string and remove None
-    clean_params = {safe_str(k): safe_str(v) for k, v in params.items() if k is not None and v is not None}
-    # Sort and URL-encode
-    sorted_params = "&".join([f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in sorted(clean_params.items())])
-    # Create string to sign
+# ===== SIGNATURE GENERATOR =====
+def sign(params, secret_key):
+    clean_params = {
+        safe_str(k): safe_str(v)
+        for k, v in params.items()
+        if k is not None and v is not None
+    }
+    sorted_params = "&".join([
+        f"{quote(safe_str(k), safe='')}"
+        f"={quote(safe_str(v), safe='')}"
+        for k, v in sorted(clean_params.items())
+    ])
     string_to_sign = f"GET\nwebservices.amazon.in\n/onca/xml\n{sorted_params}"
-    # Sign with secret key
     signature = hmac.new(
-        os.getenv("tKezT6Z+ifzkGzE2scF19bfszVRb2CsVDll6K/nd").encode('utf-8'),
+        secret_key.encode('utf-8'),
         string_to_sign.encode('utf-8'),
         hashlib.sha256
     ).digest()
     return base64.b64encode(signature).decode('utf-8')
 
+# ===== DEAL CATEGORIES =====
+CATEGORIES = [
+    {"name": "Mobile", "search_index": "Electronics", "keywords": "mobile"},
+    {"name": "Electronics", "search_index": "Electronics", "keywords": "headphones"},
+    {"name": "Women's Clothing", "search_index": "Fashion", "keywords": "women kurti"},
+    {"name": "Men's Clothing", "search_index": "Fashion", "keywords": "men tshirt"},
+    {"name": "Personal Care", "search_index": "HealthPersonalCare", "keywords": "trimmer"},
+]
+
+# ===== FETCH DEAL FROM AMAZON =====
 def get_deal():
-    # Validate all required environment variables
-    required_vars = ["AMAZON_ACCESS_KEY", "AMAZON_SECRET_KEY", "AMAZON_ASSOCIATE_TAG", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
-    for var in required_vars:
-        if not os.getenv(var):
-            print(f"❌ Missing environment variable: {var}")
+    # Validate environment variables
+    required = ["AMAZON_ACCESS_KEY", "AMAZON_SECRET_KEY", "AMAZON_ASSOCIATE_TAG", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    for key in required:
+        if not os.getenv(key):
+            print(f"❌ Missing env var: {key}")
             return None
 
-    # Prepare timestamp in ISO 8601 UTC format
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Pick random category
+    category = random.choice(CATEGORIES)
+    print(f"🔍 Searching in: {category['name']}")
 
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     params = {
         "Service": "AWSECommerceService",
         "Operation": "ItemSearch",
         "AWSAccessKeyId": os.getenv("AKPAOBWAZJ1765178442"),
         "AssociateTag": os.getenv("shopydilse-21"),
-        "SearchIndex": "All",
-        "Keywords": "diabetes supplements",
+        "SearchIndex": category["search_index"],
+        "Keywords": category["keywords"],
         "ResponseGroup": "Images,ItemAttributes,Offers",
-        "Timestamp": timestamp  # Now guaranteed to be a string
+        "Timestamp": timestamp
     }
 
     try:
-        params["Signature"] = sign(params)
+        secret_key = os.getenv("tKezT6Z+ifzkGzE2scF19bfszVRb2CsVDll6K/nd")
+        params["Signature"] = sign(params, secret_key)
     except Exception as e:
-        print("❌ Signature generation failed:", str(e))
+        print("❌ Signature error:", e)
         return None
 
     try:
         response = requests.get("https://webservices.amazon.in/onca/xml", params=params, timeout=10)
         if response.status_code != 200:
-            print(f"❌ HTTP Error: {response.status_code}")
+            print(f"❌ HTTP {response.status_code}")
             return None
 
         root = ET.fromstring(response.content)
@@ -77,17 +96,17 @@ def get_deal():
 
         item = root.find(".//Item")
         if item is None:
-            print("❌ No items found in response")
+            print("❌ No items found")
             return None
 
         def safe_find(path):
             el = item.find(path)
             return el.text if el is not None else ""
 
-        title = safe_find(".//ItemAttributes/Title") or "Unknown Product"
+        title = safe_find(".//ItemAttributes/Title") or "Product"
         image = safe_find(".//LargeImage/URL") or safe_find(".//MediumImage/URL")
         if not image:
-            print("❌ No product image found")
+            print("❌ No image")
             return None
 
         price = "₹0"
@@ -96,25 +115,42 @@ def get_deal():
             try:
                 price = "₹" + str(int(price_el.text) / 100)
             except:
-                price = "₹0"
+                pass
 
         link = safe_find(".//DetailPageURL")
         if link:
             link += f"?tag={os.getenv('AMAZON_ASSOCIATE_TAG')}"
 
-        return {"title": title, "image": image, "price": price, "link": link}
+        return {
+            "title": title,
+            "image": image,
+            "price": price,
+            "link": link,
+            "category": category["name"]
+        }
 
     except Exception as e:
         print("🚨 Exception in get_deal:", str(e))
         return None
 
+# ===== SEND TO TELEGRAM =====
 def send_to_telegram(deal):
     try:
+        tags_map = {
+            "Mobile": "#Mobile #Smartphone #Gadgets",
+            "Electronics": "#Electronics #Headphones #Tech",
+            "Women's Clothing": "#WomensFashion #Kurti #Clothing",
+            "Men's Clothing": "#MensFashion #Tshirt #Clothing",
+            "Personal Care": "#PersonalCare #Trimmer #Grooming"
+        }
+        tags = tags_map.get(deal["category"], "#AmazonDeals")
+
         caption = (
             f"🔥 <b>{deal['title']}</b>\n\n"
+            f"🏷️ Category: {deal['category']}\n"
             f"💰 Price: {deal['price']}\n"
             f"👉 <a href='{deal['link']}'>🛒 Buy on Amazon</a>\n\n"
-            f"#AmazonDeals #Diabetes #SugarControl #HealthSupplements #Affiliate #India"
+            f"{tags} #AmazonDeals #Affiliate #India"
         )
         url = f"https://api.telegram.org/bot{os.getenv('8509017131:AAG5qyXhA0tlUIAodDmjh5ohe1GJ9s9UPvo')}/sendPhoto"
         data = {
@@ -124,22 +160,23 @@ def send_to_telegram(deal):
             "parse_mode": "HTML"
         }
         resp = requests.post(url, data=data, timeout=10)
-        print("📩 Telegram response:", resp.status_code)
+        print("✅ Telegram sent | Category:", deal["category"])
     except Exception as e:
-        print("🚨 Telegram send error:", str(e))
+        print("🚨 Telegram error:", str(e))
 
+# ===== FLASK ENDPOINTS =====
 @app.route("/run")
 def run_bot():
     deal = get_deal()
     if deal:
         send_to_telegram(deal)
-        return "✅ Deal posted to Telegram!"
+        return f"✅ Deal posted! Category: {deal['category']}"
     else:
-        return "⚠️ No deal found or error occurred. Check logs."
+        return "⚠️ No deal found. Check logs."
 
 @app.route("/")
 def home():
-    return "Amazon Deal Bot is running! Visit /run to trigger."
+    return "Amazon Multi-Category Deal Bot is live! Visit /run to trigger."
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
