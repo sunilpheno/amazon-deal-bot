@@ -10,9 +10,20 @@ from xml.etree import ElementTree as ET
 
 app = Flask(__name__)
 
+def safe_str(value):
+    """Convert any value to safe string for URL encoding"""
+    if value is None:
+        return ""
+    return str(value)
+
 def sign(params):
-    sorted_params = "&".join([f"{quote(k, safe='')}={quote(params[k], safe='')}" for k in sorted(params)])
+    # Convert all values to string and remove None
+    clean_params = {safe_str(k): safe_str(v) for k, v in params.items() if k is not None and v is not None}
+    # Sort and URL-encode
+    sorted_params = "&".join([f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in sorted(clean_params.items())])
+    # Create string to sign
     string_to_sign = f"GET\nwebservices.amazon.in\n/onca/xml\n{sorted_params}"
+    # Sign with secret key
     signature = hmac.new(
         os.getenv("tKezT6Z+ifzkGzE2scF19bfszVRb2CsVDll6K/nd").encode('utf-8'),
         string_to_sign.encode('utf-8'),
@@ -22,11 +33,14 @@ def sign(params):
 
 def get_deal():
     # Validate all required environment variables
-    required = ["AMAZON_ACCESS_KEY", "AMAZON_SECRET_KEY", "AMAZON_ASSOCIATE_TAG"]
-    for key in required:
-        if not os.getenv(key):
-            print(f"❌ Missing env var: {key}")
+    required_vars = ["AMAZON_ACCESS_KEY", "AMAZON_SECRET_KEY", "AMAZON_ASSOCIATE_TAG", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    for var in required_vars:
+        if not os.getenv(var):
+            print(f"❌ Missing environment variable: {var}")
             return None
+
+    # Prepare timestamp in ISO 8601 UTC format
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     params = {
         "Service": "AWSECommerceService",
@@ -36,9 +50,14 @@ def get_deal():
         "SearchIndex": "All",
         "Keywords": "diabetes supplements",
         "ResponseGroup": "Images,ItemAttributes,Offers",
-        "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        "Timestamp": timestamp  # Now guaranteed to be a string
     }
-    params["Signature"] = sign(params)
+
+    try:
+        params["Signature"] = sign(params)
+    except Exception as e:
+        print("❌ Signature generation failed:", str(e))
+        return None
 
     try:
         response = requests.get("https://webservices.amazon.in/onca/xml", params=params, timeout=10)
@@ -74,7 +93,10 @@ def get_deal():
         price = "₹0"
         price_el = item.find(".//OfferSummary/LowestNewPrice/Amount")
         if price_el is not None:
-            price = "₹" + str(int(price_el.text) / 100)
+            try:
+                price = "₹" + str(int(price_el.text) / 100)
+            except:
+                price = "₹0"
 
         link = safe_find(".//DetailPageURL")
         if link:
@@ -113,7 +135,7 @@ def run_bot():
         send_to_telegram(deal)
         return "✅ Deal posted to Telegram!"
     else:
-        return "⚠️ No deal found. Check logs for details."
+        return "⚠️ No deal found or error occurred. Check logs."
 
 @app.route("/")
 def home():
